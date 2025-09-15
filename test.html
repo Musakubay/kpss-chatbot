@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <title>KPSS Uzmanı Test (GPT‑4.1 + OCR)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background: #fafafa; }
+    .container { max-width: 900px; margin: auto; }
+    textarea, input[type="file"] { width: 100%; margin: 8px 0; padding: 8px; }
+    button { padding: 10px 15px; margin-top: 8px; cursor: pointer; }
+    pre { background: #f4f4f4; padding: 10px; border-radius: 6px; white-space: pre-wrap; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 320px; }
+    h3 { margin-bottom: 8px; }
+    .status { margin-top: 6px; color: #555; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>📘 KPSS Uzmanı - Test</h2>
+
+    <div class="row">
+      <div class="col">
+        <h3>✍️ Yazılı Soru (Text)</h3>
+        <textarea id="q" rows="5" placeholder="Sorunuzu yazın...">Cumhuriyetin ilanının sonuçlarını açıkla</textarea>
+        <button id="btnText">➡️ Gönder (Text)</button>
+        <div class="status" id="textStatus"></div>
+      </div>
+      <div class="col">
+        <h3>🖼️ Görsel Soru (OCR)</h3>
+        <input type="file" id="fileInput" accept="image/*" />
+        <button id="btnOCR">➡️ Gönder (OCR)</button>
+        <div class="status" id="ocrStatus"></div>
+      </div>
+    </div>
+
+    <h3>📥 Model Cevabı (Özet)</h3>
+    <pre id="answer">Henüz cevap yok...</pre>
+
+    <h3>🧾 Tam Cevap (Ham JSON veya Metin)</h3>
+    <pre id="raw">Henüz cevap yok...</pre>
+
+    <h3>🔎 OCR Sonucu (Görselden Çıkan Metin)</h3>
+    <pre id="ocrOut">Henüz OCR yapılmadı...</pre>
+  </div>
+
+  <script>
+    const API_BASE = "http://127.0.0.1:8000";
+
+    function extractAssistantAnswer(data) {
+      try {
+        // Abacus/OpenAI benzeri yanıt formatları
+        if (data && data.choices && data.choices.length > 0) {
+          const m = data.choices[0].message;
+          if (m && m.content) return m.content;
+        }
+        if (data && data.message && data.message.content) return data.message.content;
+      } catch (_) {}
+      return null;
+    }
+
+    async function sendText() {
+      const msg = document.getElementById("q").value;
+      const statusEl = document.getElementById("textStatus");
+      const answerEl = document.getElementById("answer");
+      const rawEl = document.getElementById("raw");
+
+      statusEl.textContent = "Gönderiliyor...";
+      answerEl.textContent = "";
+      rawEl.textContent = "";
+
+      try {
+        const res = await fetch(`${API_BASE}/kpss-text`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          mode: "cors",
+          body: JSON.stringify({
+            messages: [
+              { role: "user", content: [{ type: "text", text: msg }] }
+            ]
+          })
+        });
+
+        const body = await res.text();
+        rawEl.textContent = `Status: ${res.status}\n` + body;
+
+        let data = null;
+        try { data = JSON.parse(body); } catch (_) {}
+        const ans = data ? extractAssistantAnswer(data) : null;
+        answerEl.textContent = ans || "(Asistan cevabı çıkarılamadı. Ham içerik yukarıda.)";
+
+        statusEl.textContent = res.ok ? "Tamam" : `Hata: ${res.status}`;
+      } catch (err) {
+        statusEl.textContent = "İstek hatası: " + err.message;
+        rawEl.textContent = "Fetch error: " + err.message;
+        console.error(err);
+      }
+    }
+
+    async function sendOCR() {
+      const fileInput = document.getElementById("fileInput");
+      const statusEl = document.getElementById("ocrStatus");
+      const ocrEl = document.getElementById("ocrOut");
+      const answerEl = document.getElementById("answer");
+      const rawEl = document.getElementById("raw");
+
+      if (!fileInput.files.length) {
+        alert("Lütfen bir görsel seçin.");
+        return;
+      }
+
+      statusEl.textContent = "Gönderiliyor...";
+      ocrEl.textContent = "";
+      answerEl.textContent = "";
+      rawEl.textContent = "";
+
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+
+      try {
+        const res = await fetch(`${API_BASE}/kpss-ocr`, {
+          method: "POST",
+          cache: "no-store",
+          mode: "cors",
+          body: formData
+        });
+
+        const body = await res.text();
+        rawEl.textContent = `Status: ${res.status}\n` + body;
+
+        let data = null;
+        try { data = JSON.parse(body); } catch (_) {}
+
+        if (data && data.ocr_extracted_text) {
+          ocrEl.textContent = data.ocr_extracted_text;
+        } else {
+          ocrEl.textContent = "(OCR sonucu bulunamadı ya da boş.)";
+        }
+
+        const ans = data ? extractAssistantAnswer(data) : null;
+        answerEl.textContent = ans || "(Asistan cevabı çıkarılamadı. Ham içerik yukarıda.)";
+
+        statusEl.textContent = res.ok ? "Tamam" : `Hata: ${res.status}`;
+      } catch (err) {
+        statusEl.textContent = "İstek hatası: " + err.message;
+        rawEl.textContent = "Fetch error: " + err.message;
+        console.error(err);
+      }
+    }
+
+    document.getElementById("btnText").addEventListener("click", sendText);
+    document.getElementById("btnOCR").addEventListener("click", sendOCR);
+  </script>
+</body>
+</html>

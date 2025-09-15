@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <button onclick="ping()">Ping /health</button>
+    <pre id="out"></pre>
+    <script>
+      const API_BASE = "http://localhost:8000";
+      async function ping() {
+        try {
+          const res = await fetch(`${API_BASE}/health`, { method: "GET" });
+          const text = await res.text();
+          document.getElementById("out").innerText = `Status: ${res.status}\n` + text;
+        } catch (e) {
+          document.getElementById("out").innerText = "Fetch error: " + e.message;
+        }
+      }
+    </script>
+  </body>
+</html>
