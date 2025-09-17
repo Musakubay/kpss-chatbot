@@ -855,3 +855,318 @@ async def import_mock_positions():
     ]
     repo_insert_positions(sample)
     return json_utf8({"ok": True, "inserted": len(sample)})
+# ==================== KPSS Tercih Robotu - AI Öneri Katmanı ====================
+
+from enum import Enum
+
+class AiGoal(str, Enum):
+    safe = "safe"        # garanti odaklı
+    balanced = "balanced"
+    bold = "bold"        # iddialı
+
+class AiRecommendRequest(BaseModel):
+    profile: UserProfile
+    filters: Optional[Dict[str, Any]] = None
+    goal: AiGoal = AiGoal.balanced
+    top_n: int = 30
+    use_llm: bool = False           # true ise LLM rerank + açıklama
+    llm_explain_top_k: int = 20     # açıklama üretilecek ilk K kayıt
+    llm_rerank_top_k: int = 50      # rerank için ilk K kayıt
+
+class AiSuggestion(BaseModel):
+    position_id: str
+    institution: str
+    title: str
+    province: str
+    base_score: Optional[float] = None
+    quota: int
+    match_score: float
+    preference_score: float
+    bucket: str
+    risk: str
+    reasons: List[str] = Field(default_factory=list)
+    ai_note: Optional[str] = None   # LLM açıklaması (opsiyonel)
+
+class AiRecommendResponse(BaseModel):
+    ok: bool
+    suggestions: List[AiSuggestion]
+    strategy: Optional[str] = None
+
+def _city_boost(profile: UserProfile, pos: Position) -> float:
+    pr = (pos.province or "").strip().lower()
+    prefers = [s.strip().lower() for s in profile.preferred_provinces]
+    excluded = [s.strip().lower() for s in profile.excluded_provinces]
+    if pr in excluded:
+        return -20.0
+    if pr in prefers:
+        return 10.0
+    return 0.0
+
+def _quota_effect(pos: Position) -> float:
+    import math
+    q = pos.quota or 1
+    return min(10.0, math.log1p(q) * 3.0)
+
+def _base_gap_effect(profile: UserProfile, pos: Position) -> float:
+    if pos.base_score is None:
+        return 0.0
+    gap = profile.score - float(pos.base_score)
+    return max(-10.0, min(10.0, gap / 2.0))
+
+def _preference_score(profile: UserProfile, pos: Position, match_score: float) -> float:
+    # Heuristik harman
+    ps = (
+        0.6 * match_score +
+        0.2 * _city_boost(profile, pos) +
+        0.1 * _quota_effect(pos) +
+        0.1 * _base_gap_effect(profile, pos)
+    )
+    return float(max(0.0, min(100.0, ps)))
+
+def _bucket_of(goal: AiGoal, pref_score: float, risk: str) -> str:
+    r = (risk or "").lower()
+    if pref_score >= 75 and r in ("düşük", "dusuk", "low"):
+        return "safe"
+    if pref_score >= 55:
+        return "balanced"
+    return "bold"
+
+def _simple_strategy_text(goal: AiGoal, suggestions: List[AiSuggestion]) -> str:
+    safe_count = sum(1 for s in suggestions if s.bucket == "safe")
+    bal_count = sum(1 for s in suggestions if s.bucket == "balanced")
+    bold_count = sum(1 for s in suggestions if s.bucket == "bold")
+    if goal == AiGoal.safe:
+        return f"Önceliğiniz güvenli tercihler. Dağılım: {safe_count} güvenli, {bal_count} dengeli, {bold_count} iddialı."
+    if goal == AiGoal.bold:
+        return f"Önceliğiniz iddialı tercihler. Dağılım: {safe_count} güvenli, {bal_count} dengeli, {bold_count} iddialı."
+    return f"Dengeli bir liste önerildi. Dağılım: {safe_count} güvenli, {bal_count} dengeli, {bold_count} iddialı."
+
+async def _llm_rerank(profile: UserProfile, items: List[Dict[str, Any]]) -> List[float]:
+    """
+    items: [{pos: Position, match_score: float, pref_score: float, reasons: [...]}, ...] (ilk K öğe)
+    Dönen: her item için 0-100 arası rerank_score listesi (aynı sırada).
+    """
+    # Kısa, maliyet dostu bir prompt; JSON benzeri skor dizisi istiyoruz.
+    # LLM’den deterministik bir sayı seti almaya çalışıyoruz (temperature=0).
+    lines = []
+    for i, it in enumerate(items, start=1):
+        p: Position = it["pos"]
+        lines.append(
+            f"{i}. id={p.id}, kurum={p.institution}, unvan={p.title}, il={p.province}, "
+            f"taban={p.base_score}, kontenjan={p.quota}, match={it['match_score']:.1f}, "
+            f"pref={it['pref_score']:.1f}"
+        )
+    prompt = (
+        "Aşağıda KPSS ilan listesi veriliyor. Her satır bir ilan. "
+        "0-100 arası 'rerank_score' üret ve sadece sayıları virgülle ayırarak sırayla döndür. "
+        "Detay yazma, sadece sayılar.\n\n" +
+        "\n".join(lines)
+    )
+
+    payload = ChatRequest(
+        messages=[
+            ChatMessage(role="system", content=[ChatContentText(text=kpss_guardrails_instruction())]),
+            ChatMessage(role="user", content=[ChatContentText(text=prompt)]),
+        ],
+        temperature=0.0,
+        stream=False,
+    )
+    res = await call_deployment(TEXT_DEPLOYMENT_ID, payload)
+    if not res.get("ok"):
+        # Hata olursa rerank yapmayız, 0 döneriz (nötr)
+        return [0.0] * len(items)
+
+    text = (res.get("text") or "").strip()
+    # "12, 54, 66, 70, 10" gibi bir dize bekliyoruz
+    nums = []
+    for part in text.replace("\n", ",").split(","):
+        part = part.strip().replace("%", "")
+        try:
+            v = float(part)
+            v = max(0.0, min(100.0, v))
+            nums.append(v)
+        except:
+            continue
+
+    if len(nums) < len(items):
+        # Eksikse kalanları 0 yap
+        nums += [0.0] * (len(items) - len(nums))
+    return nums[:len(items)]
+
+async def _llm_explain(profile: UserProfile, items: List[Dict[str, Any]]) -> List[str]:
+    """
+    items: [{pos: Position, match_score: float, pref_score: float, reasons: [...]}, ...] (ilk K)
+    Dönen: Kısa ai_note listesi (aynı sırada).
+    """
+    notes: List[str] = []
+    for it in items:
+        p: Position = it["pos"]
+        reasons = it.get("reasons", [])
+        rp = (
+            f"Profil: puan={profile.score} ({profile.score_type}), eğitim={profile.edu_level}, "
+            f"tercih iller={profile.preferred_provinces}, hariç iller={profile.excluded_provinces}.\n"
+            f"İlan: {p.institution} - {p.title} ({p.province}), taban={p.base_score}, kontenjan={p.quota}.\n"
+            f"Nedenler: {', '.join(reasons)}\n"
+            "Bu ilan için 1-2 cümle net ve kısa bir öneri notu yaz."
+        )
+        payload = ChatRequest(
+            messages=[
+                ChatMessage(role="system", content=[ChatContentText(text=kpss_guardrails_instruction())]),
+                ChatMessage(role="user", content=[ChatContentText(text=rp)]),
+            ],
+            temperature=0.2,
+            stream=False,
+        )
+        res = await call_deployment(TEXT_DEPLOYMENT_ID, payload)
+        note = (res.get("text") or "").strip() if res.get("ok") else None
+        # Çok uzun ise kısalt
+        if note and len(note) > 240:
+            note = note[:237] + "..."
+        notes.append(note or "")
+    return notes
+
+@app.post("/kpss/ai/recommendations", response_model=AiRecommendResponse)
+async def kpss_ai_recommendations(req: AiRecommendRequest):
+    # 1) Pozisyonları al
+    positions = repo_list_positions(req.filters or {})
+    if not positions:
+        return AiRecommendResponse(ok=True, suggestions=[], strategy="Uygun ilan bulunamadı.")
+
+    # 2) Mevcut matcher ile skorlar
+    match_results = [evaluate_position(req.profile, p) for p in positions]
+    match_by_id = {m.position_id: m for m in match_results}
+
+    # 3) Eligible filtre + heuristik skor
+    items = []
+    for p in positions:
+        m = match_by_id.get(p.id)
+        if not m or m.status != "eligible":
+            continue
+        ms = float(m.match_score)
+        ps = _preference_score(req.profile, p, ms)
+        items.append({"pos": p, "match_score": ms, "pref_score": ps, "risk": m.risk, "reasons": m.reasons})
+
+    if not items:
+        return AiRecommendResponse(ok=True, suggestions=[], strategy="Uygun ilan bulunamadı (eligibility).")
+
+    # 4) Heuristik sıralama
+    items.sort(key=lambda x: x["pref_score"], reverse=True)
+
+    # 5) Opsiyonel LLM rerank (ilk K için)
+    if req.use_llm and req.llm_rerank_top_k > 0:
+        topk = items[:req.llm_rerank_top_k]
+        rerank_scores = await _llm_rerank(req.profile, topk)
+        # Harmanlama: yeni_pref = 0.7 * pref + 0.3 * rerank
+        for i, sc in enumerate(rerank_scores):
+            topk[i]["pref_score"] = 0.7 * topk[i]["pref_score"] + 0.3 * float(sc)
+        # Hepsini tekrar sırala
+        items.sort(key=lambda x: x["pref_score"], reverse=True)
+
+    # 6) Öneri listesi oluştur
+    trimmed = items[:req.top_n]
+    ai_notes = []
+    if req.use_llm and req.llm_explain_top_k > 0:
+        explain_pack = trimmed[:req.llm_explain_top_k]
+        ai_notes = await _llm_explain(req.profile, explain_pack)
+        # Explain sayısı kadar doldur, geri kalanı boş
+        if len(ai_notes) < len(trimmed):
+            ai_notes += [""] * (len(trimmed) - len(ai_notes))
+    else:
+        ai_notes = [""] * len(trimmed)
+
+    suggestions: List[AiSuggestion] = []
+    for idx, it in enumerate(trimmed):
+        p: Position = it["pos"]
+        bucket = _bucket_of(req.goal, it["pref_score"], it["risk"])
+        suggestions.append(AiSuggestion(
+            position_id=p.id,
+            institution=p.institution,
+            title=p.title,
+            province=p.province,
+            base_score=p.base_score,
+            quota=p.quota,
+            match_score=round(it["match_score"], 1),
+            preference_score=round(it["pref_score"], 1),
+            bucket=bucket,
+            risk=it["risk"],
+            reasons=it["reasons"],
+            ai_note=ai_notes[idx] if idx < len(ai_notes) else None
+        ))
+
+    # 7) Strateji metni
+    strategy = _simple_strategy_text(req.goal, suggestions)
+    return AiRecommendResponse(ok=True, suggestions=suggestions, strategy=strategy)
+
+class ExplainRequest(BaseModel):
+    profile: UserProfile
+    position_id: str
+
+@app.post("/kpss/ai/explain")
+async def kpss_ai_explain(req: ExplainRequest):
+    pos_list = repo_get_positions_by_ids([req.position_id])
+    if not pos_list:
+        raise HTTPException(status_code=404, detail="İlan bulunamadı")
+    p = pos_list[0]
+    m = evaluate_position(req.profile, p)
+
+    prompt = (
+        f"Kullanıcı profili: puan={req.profile.score} ({req.profile.score_type}), eğitim={req.profile.edu_level}, "
+        f"tercih iller={req.profile.preferred_provinces}, hariç iller={req.profile.excluded_provinces}.\n"
+        f"İlan: {p.institution} - {p.title} ({p.province}), taban={p.base_score}, kontenjan={p.quota}.\n"
+        f"Eşleşme skoru: {m.match_score:.1f}, risk: {m.risk}.\n"
+        f"Nedenler: {', '.join(m.reasons)}\n"
+        "Bu ilan için 1-3 cümle açıklayıcı, kısa ve net bir öneri yaz."
+    )
+
+    res = await call_deployment(
+        TEXT_DEPLOYMENT_ID,
+        ChatRequest(messages=[
+            ChatMessage(role="system", content=[ChatContentText(text=kpss_guardrails_instruction())]),
+            ChatMessage(role="user", content=[ChatContentText(text=prompt)]),
+        ], temperature=0.2, stream=False)
+    )
+    if not res.get("ok"):
+        return json_utf8({"ok": False, "error": res.get("error", "LLM hatası")}, status_code=res.get("status", 500))
+    return json_utf8({"ok": True, "note": (res.get("text") or "").strip()})
+
+class RerankRequest(BaseModel):
+    profile: UserProfile
+    position_ids: List[str]
+    use_llm: bool = True
+
+@app.post("/kpss/ai/rerank")
+async def kpss_ai_rerank(req: RerankRequest):
+    positions = repo_get_positions_by_ids(req.position_ids)
+    if not positions:
+        return json_utf8({"ok": True, "items": []})
+
+    items = []
+    for p in positions:
+        m = evaluate_position(req.profile, p)
+        if m.status != "eligible":
+            continue
+        pref = _preference_score(req.profile, p, float(m.match_score))
+        items.append({"pos": p, "match_score": float(m.match_score), "pref_score": pref, "reasons": m.reasons})
+
+    if not items:
+        return json_utf8({"ok": True, "items": []})
+
+    items.sort(key=lambda x: x["pref_score"], reverse=True)
+
+    if req.use_llm:
+        topk = items[: min(50, len(items))]
+        rerank_scores = await _llm_rerank(req.profile, topk)
+        for i, sc in enumerate(rerank_scores):
+            topk[i]["pref_score"] = 0.7 * topk[i]["pref_score"] + 0.3 * float(sc)
+        items.sort(key=lambda x: x["pref_score"], reverse=True)
+
+    out = [{
+        "position_id": it["pos"].id,
+        "institution": it["pos"].institution,
+        "title": it["pos"].title,
+        "province": it["pos"].province,
+        "preference_score": round(it["pref_score"], 1),
+        "match_score": round(it["match_score"], 1),
+    } for it in items]
+
+    return json_utf8({"ok": True, "items": out})
