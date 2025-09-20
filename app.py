@@ -1,28 +1,33 @@
+# -*- coding: utf-8 -*-
 import os
 import json
-from io import BytesIO
-from typing import Any, Dict, List, Optional, Union
-import sqlite3
-from contextlib import contextmanager
-import asyncio
 import math
+import asyncio
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import sqlite3
+from contextlib import contextmanager, asynccontextmanager
 
 import httpx
 import pytesseract
 from PIL import Image
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile, Query
+
+from fastapi import FastAPI, File, HTTPException, UploadFile, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
+from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 
-# ==================== ENV & CONFIG ====================
+# =============================================================================
+# ENV & CONFIG
+# =============================================================================
 load_dotenv()
 
 DEEPAGENT_URL = os.getenv("DEEPAGENT_URL")  # örn: https://routellm.abacus.ai/v1/chat/completions
 DEEPAGENT_KEY = os.getenv("DEEPAGENT_KEY", "")
-TEXT_DEPLOYMENT_ID = os.getenv("TEXT_DEPLOYMENT_ID")
+TEXT_DEPLOYMENT_ID = os.getenv("TEXT_DEPLOYMENT_ID", "disabled")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
@@ -40,19 +45,30 @@ OCR_MAX_SIDE = int(os.getenv("OCR_MAX_SIDE", "1600"))
 # AI varsayılanları
 DEFAULT_LLM_EXPLAIN_TOP_K = int(os.getenv("LLM_EXPLAIN_TOP_K", "10"))
 DEFAULT_LLM_RERANK_TOP_K = int(os.getenv("LLM_RERANK_TOP_K", "30"))
+MAX_TOP_N = 200
 
-if not DEEPAGENT_URL:
-    raise RuntimeError("DEEPAGENT_URL .env içinde tanımlı değil")
-if not DEEPAGENT_KEY:
-    raise RuntimeError("DEEPAGENT_KEY .env içinde tanımlı değil")
-if not TEXT_DEPLOYMENT_ID:
-    raise RuntimeError("TEXT_DEPLOYMENT_ID .env içinde tanımlı değil")
+# =============================================================================
+# APP (Single FastAPI with Lifespan)
+# =============================================================================
 
-# ==================== FASTAPI APP ====================
+http_client: Optional[httpx.AsyncClient] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+    try:
+        yield
+    finally:
+        if http_client:
+            await http_client.aclose()
+            http_client = None
+
 app = FastAPI(
     title="KPSS Uzmanı API (Chat + OCR + Quiz + Define + Karşılıklı Soru + Tercih Robotu)",
     description="Performans iyileştirmeleriyle güncellenmiş sürüm",
-    version="7.0.0",
+    version="8.0.0",
+    lifespan=lifespan,
 )
 
 origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
@@ -64,22 +80,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global HTTP client (connection pooling)
-http_client: Optional[httpx.AsyncClient] = None
+# =============================================================================
+# Common JSON helper
+# =============================================================================
 
-@app.on_event("startup")
-async def on_startup():
-    global http_client
-    http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+def json_utf8(content: Any, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(content=content, status_code=status_code, media_type="application/json; charset=utf-8")
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    global http_client
-    if http_client:
-        await http_client.aclose()
-        http_client = None
+# =============================================================================
+# Chat/Multimodal Models (Pydantic)
+# =============================================================================
 
-# ==================== MODELLER ====================
 class ChatContentText(BaseModel):
     type: str = "text"
     text: str
@@ -123,41 +134,9 @@ class QuizEvalRequest(BaseModel):
     sessionId: Optional[str] = None
     temperature: Optional[float] = 0.2
 
-# ==================== YARDIMCI FONKSIYONLAR ====================
-def json_utf8(content: Any, status_code: int = 200) -> JSONResponse:
-    return JSONResponse(content=content, status_code=status_code, media_type="application/json; charset=utf-8")
-
-def extract_text_from_abacus(resp: Any) -> str:
-    if not isinstance(resp, dict):
-        try:
-            return json.dumps(resp, ensure_ascii=False)
-        except Exception:
-            return str(resp)
-
-    choices = resp.get("choices")
-    if isinstance(choices, list) and choices:
-        msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for c in content:
-                if isinstance(c, dict) and c.get("type") == "text":
-                    parts.append(c.get("text", ""))
-            txt = "\n".join([p for p in parts if p])
-            if txt:
-                return txt
-
-    for key in ("content", "text"):
-        val = resp.get(key)
-        if isinstance(val, str) and val.strip():
-            return val
-
-    try:
-        return json.dumps(resp, ensure_ascii=False)
-    except Exception:
-        return str(resp)
+# =============================================================================
+# Guardrail & Prompt helpers
+# =============================================================================
 
 def kpss_guardrails_instruction() -> str:
     return (
@@ -208,8 +187,46 @@ def quiz_eval_instruction() -> str:
         "- KPSS kapsamı dışına çıkma."
     )
 
-# ==================== DEEPAGENT CALL ====================
+# =============================================================================
+# Abacus/DeepAgent Call
+# =============================================================================
+
+def extract_text_from_abacus(resp: Any) -> str:
+    if not isinstance(resp, dict):
+        try:
+            return json.dumps(resp, ensure_ascii=False)
+        except Exception:
+            return str(resp)
+
+    choices = resp.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    parts.append(c.get("text", ""))
+            txt = "\n".join([p for p in parts if p])
+            if txt:
+                return txt
+
+    for key in ("content", "text"):
+        val = resp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+
+    try:
+        return json.dumps(resp, ensure_ascii=False)
+    except Exception:
+        return str(resp)
+
 async def call_deployment(deployment_id: str, payload: ChatRequest) -> Dict[str, Any]:
+    if TEXT_DEPLOYMENT_ID == "disabled":
+        return {"ok": False, "status": 503, "error": "LLM disabled"}
+
     global http_client
     if http_client is None:
         http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
@@ -221,7 +238,7 @@ async def call_deployment(deployment_id: str, payload: ChatRequest) -> Dict[str,
 
     forward_body: Dict[str, Any] = {
         "deploymentId": deployment_id,
-        "messages": [m.dict() for m in payload.messages],
+        "messages": [m.model_dump() for m in payload.messages],
         "stream": False if payload.stream is None else payload.stream,
     }
     if payload.sessionId:
@@ -256,7 +273,10 @@ async def call_deployment(deployment_id: str, payload: ChatRequest) -> Dict[str,
     except Exception as e:
         return {"ok": False, "status": 500, "error": f"Internal error: {str(e)}"}
 
-# ==================== ENDPOINTS: HEALTH / TEXT / QUIZ / OCR / DEFINE ====================
+# =============================================================================
+# HEALTH / TEXT / QUIZ / OCR / DEFINE
+# =============================================================================
+
 @app.get("/health")
 async def health():
     return json_utf8({"status": "ok", "deployment": TEXT_DEPLOYMENT_ID, "cors_origins": origins})
@@ -269,16 +289,13 @@ async def kpss_text(payload: ChatRequest):
     system_msg = ChatMessage(role="system", content=[ChatContentText(text=kpss_guardrails_instruction())])
     messages = [system_msg] + payload.messages
 
-    result = await call_deployment(
-        TEXT_DEPLOYMENT_ID,
-        ChatRequest(
-            messages=messages,
-            sessionId=payload.sessionId,
-            meta=payload.meta,
-            temperature=payload.temperature,
-            stream=payload.stream,
-        )
-    )
+    result = await call_deployment(TEXT_DEPLOYMENT_ID, ChatRequest(
+        messages=messages,
+        sessionId=payload.sessionId,
+        meta=payload.meta,
+        temperature=payload.temperature,
+        stream=payload.stream,
+    ))
     return json_utf8(result, status_code=result.get("status", 200))
 
 @app.post("/kpss-quiz")
@@ -290,25 +307,18 @@ async def kpss_quiz(payload: ChatRequest):
         ChatMessage(role="system", content=[ChatContentText(text=kpss_guardrails_instruction())]),
         ChatMessage(role="system", content=[ChatContentText(text=quiz_mode_instruction())]),
     ]
-
     messages = system_msgs + payload.messages
 
-    # İlk mesaj "start" ise tek çağrıda soru üretmesi için yönlendir
     try:
         first = payload.messages[0].content[0]
         if isinstance(first, ChatContentText):
             t = first.text.strip().lower()
             if t in ("start", "start_quiz", "başla", "quiz", "soru"):
-                messages.append(
-                    ChatMessage(role="user", content=[ChatContentText(text="İlk sorunu sor, şıkları ver.")])
-                )
+                messages.append(ChatMessage(role="user", content=[ChatContentText(text="İlk sorunu sor, şıkları ver.")]))
     except Exception:
         pass
 
-    result = await call_deployment(
-        TEXT_DEPLOYMENT_ID,
-        ChatRequest(messages=messages, sessionId=payload.sessionId, temperature=payload.temperature, stream=payload.stream)
-    )
+    result = await call_deployment(TEXT_DEPLOYMENT_ID, ChatRequest(messages=messages, sessionId=payload.sessionId, temperature=payload.temperature, stream=payload.stream))
     return json_utf8(result, status_code=result.get("status", 200))
 
 @app.post("/kpss-ocr")
@@ -393,16 +403,13 @@ async def kpss_define(payload: DefineRequest):
     }
     return json_utf8(out, status_code=out["status"])
 
-# ==================== QUIZ QUESTION / EVAL (Tek çağrıya optimize) ====================
 @app.post("/kpss-quiz-question")
 async def kpss_quiz_question(req: QuizQuestionRequest):
     system_msgs = [
         ChatMessage(role="system", content=[ChatContentText(text=kpss_guardrails_instruction())]),
         ChatMessage(role="system", content=[ChatContentText(text=quiz_generation_instruction(req.ders, req.konu, req.zorluk))]),
     ]
-    user_prompt = (
-        "Sadece soru kökü ve şıkları ver. En sonda 'İpucu:' ile tek satır ipucu ekle."
-    )
+    user_prompt = "Sadece soru kökü ve şıkları ver. En sonda 'İpucu:' ile tek satır ipucu ekle."
 
     result = await call_deployment(
         TEXT_DEPLOYMENT_ID,
@@ -494,63 +501,8 @@ async def kpss_quiz_eval(req: QuizEvalRequest):
     }
     return json_utf8(out)
 
-# -*- coding: utf-8 -*-
-import csv
-import io
-import json
-import math
-import os
-import sqlite3
-from contextlib import contextmanager
-from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
-
-from fastapi import FastAPI, HTTPException, Query, Body
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
-from pydantic import BaseModel, Field, field_validator
-
 # =============================================================================
-# Config
-# =============================================================================
-
-SQLITE_PATH = os.environ.get("SQLITE_PATH", "kpss.db")
-TEXT_DEPLOYMENT_ID = os.environ.get("TEXT_DEPLOYMENT_ID", "disabled")  # LLM kapalıysa 'disabled'
-DEFAULT_LLM_EXPLAIN_TOP_K = 10
-DEFAULT_LLM_RERANK_TOP_K = 30
-MAX_TOP_N = 200
-
-app = FastAPI(title="KPSS Preference Backend", version="2.0.0")
-
-# =============================================================================
-# SQLite Connection + Pragmas
-# =============================================================================
-
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("PRAGMA temp_store=MEMORY")
-    c.execute("PRAGMA mmap_size=268435456")  # 256MB
-    c.execute("PRAGMA foreign_keys=ON")
-    c.close()
-    return conn
-
-@contextmanager
-def db():
-    conn = _connect()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-# =============================================================================
-# Models (Pydantic)
+# Preference System Models
 # =============================================================================
 
 class Position(BaseModel):
@@ -614,8 +566,7 @@ class SavePreferenceItem(BaseModel):
 
 class SavePreferenceRequest(BaseModel):
     user_id: str
-    # backward compatible: accept list[str] or list[{position_id, priority}]
-    preferences: List[Any]
+    preferences: List[Any]  # list[str] or list[{position_id, priority}]
     notes: Optional[Dict[str, str]] = None
 
 class AiGoal(str, Enum):
@@ -668,6 +619,34 @@ class RerankRequest(BaseModel):
     profile: UserProfile
     position_ids: List[str]
     use_llm: bool = True
+
+# =============================================================================
+# SQLite Connection + Pragmas
+# =============================================================================
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA temp_store=MEMORY")
+    c.execute("PRAGMA mmap_size=268435456")  # 256MB
+    c.execute("PRAGMA foreign_keys=ON")
+    c.close()
+    return conn
+
+@contextmanager
+def db():
+    conn = _connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 # =============================================================================
 # Init DB (Tables, Indexes, FTS5)
@@ -759,7 +738,7 @@ init_sqlite()
 init_fts()
 
 # =============================================================================
-# Utils
+# Utils: JSON and text
 # =============================================================================
 
 def _to_json(obj) -> str:
@@ -772,9 +751,6 @@ def _from_json(s: Optional[str], default):
         return json.loads(s)
     except Exception:
         return default
-
-def json_utf8(obj: Dict[str, Any], status_code: int = 200):
-    return JSONResponse(content=obj, status_code=status_code, media_type="application/json; charset=utf-8")
 
 def normalize_city(x: Optional[str]) -> Optional[str]:
     if not x:
@@ -844,20 +820,20 @@ def _build_position_query(filters: Optional[Dict[str, Any]] = None,
         order_sql = f" ORDER BY {valid_order[order_by]} {direction}"
 
     lim_sql = ""
+    lim_params: List[Any] = []
     if limit is not None:
         lim_sql += " LIMIT ?"
-        params.append(int(limit))
+        lim_params.append(int(limit))
         if offset is not None:
             lim_sql += " OFFSET ?"
-            params.append(int(offset))
+            lim_params.append(int(offset))
 
     select_sql = "SELECT * " + base + order_sql + lim_sql
-    # count params shouldn't include limit/offset
-    count_params = params[:]
-    if limit is not None:
-        count_params = params[:-2] if offset is not None else params[:-1]
     count_sql = "SELECT COUNT(1) as cnt " + base
-    return select_sql, params, count_sql, count_params
+    select_params = params + lim_params
+    count_params = params[:]  # limit/offset olmadan
+
+    return select_sql, select_params, count_sql, count_params
 
 def repo_list_positions(filters: Optional[Dict[str, Any]] = None,
                         order_by: Optional[str] = None,
@@ -925,7 +901,6 @@ def repo_search_positions(q: str,
         "term": "p.term",
         "relevance": "rank"
     }
-    # rank by BM25
     order_sql = ""
     if order_by in valid_order:
         direction = "DESC" if (order_dir or "").lower() == "desc" else "ASC"
@@ -1012,8 +987,19 @@ def repo_list_favorites(user_id: str) -> List[str]:
         c.execute("SELECT position_id FROM user_favorites WHERE user_id=? ORDER BY id DESC", (user_id,))
         return [r["position_id"] for r in c.fetchall()]
 
+def repo_toggle_favorite(user_id: str, position_id: str) -> bool:
+    with db() as conn:
+        c = conn.cursor()
+        # try delete first
+        c.execute("DELETE FROM user_favorites WHERE user_id=? AND position_id=?", (user_id, position_id))
+        if c.rowcount > 0:
+            return False  # removed
+        # else insert
+        c.execute("INSERT OR IGNORE INTO user_favorites(user_id, position_id) VALUES (?, ?)", (user_id, position_id))
+        return True  # added
+
 # =============================================================================
-# Rule Engine (Basit ve genişletilebilir)
+# Rule Engine
 # =============================================================================
 
 def _rule_3001(profile: UserProfile, pos: Position):
@@ -1030,7 +1016,6 @@ def _rule_ziraat(profile: UserProfile, pos: Position):
     ok = any(k in ml for k in ["ziraat", "ziraat müh", "bitki koruma"])
     return ok, ("Ziraat müh. uygun" if ok else "Ziraat mühendisliği mezunu olmalı")
 
-# Kural sözlüğü: (mandatory, function)
 RULES = {
     "3001": (True, _rule_3001),
     "BILGISAYAR_SERT": (True, _rule_bilgisayar_sert),
@@ -1048,7 +1033,6 @@ def evaluate_position(profile: UserProfile, pos: Position) -> MatchResult:
         if mandatory and not ok:
             eligible = False
 
-    # İl tercihleri
     prov_norm = normalize_city(pos.province)
     pref_norm = [normalize_city(x) for x in profile.preferred_provinces]
     excl_norm = [normalize_city(x) for x in profile.excluded_provinces]
@@ -1058,7 +1042,6 @@ def evaluate_position(profile: UserProfile, pos: Position) -> MatchResult:
     if pref_norm and prov_norm in pref_norm:
         reasons.append(f"Tercih edilen il: {pos.province}")
 
-    # Basit skor
     match = 60.0 if eligible else 25.0
     if pref_norm and prov_norm in pref_norm:
         match += 10.0
@@ -1082,7 +1065,7 @@ def evaluate_position(profile: UserProfile, pos: Position) -> MatchResult:
     )
 
 # =============================================================================
-# AI Layer (LLM optional, graceful degrade)
+# AI Layer (LLM optional)
 # =============================================================================
 
 def _city_boost(profile: UserProfile, pos: Position) -> float:
@@ -1132,21 +1115,12 @@ def _simple_strategy_text(goal: AiGoal, suggestions: List[AiSuggestion]) -> str:
         return f"Önceliğiniz iddialı tercihler. Dağılım: {safe_count} güvenli, {bal_count} dengeli, {bold_count} iddialı."
     return f"Dengeli bir liste önerildi. Dağılım: {safe_count} güvenli, {bal_count} dengeli, {bold_count} iddialı."
 
-# Placeholder LLM calls
-async def call_deployment(deployment_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {"ok": False, "error": "LLM disabled"}
-
-def kpss_guardrails_instruction() -> str:
-    return "You are a concise assistant for KPSS preference suggestions."
-
 async def _llm_rerank(profile: UserProfile, items: List[Dict[str, Any]]) -> List[float]:
     if not items:
         return []
     if TEXT_DEPLOYMENT_ID == "disabled":
         return [0.0] * len(items)
-    res = await call_deployment(TEXT_DEPLOYMENT_ID, {"messages": [{"role": "system", "content": kpss_guardrails_instruction()}], "temperature": 0.0})
-    if not res.get("ok"):
-        return [0.0] * len(items)
+    # Burada gerçek LLM çağrısı tasarlanabilir (özet + puan)
     return [0.0] * len(items)
 
 async def _llm_explain(profile: UserProfile, items: List[Dict[str, Any]]) -> List[str]:
@@ -1154,18 +1128,12 @@ async def _llm_explain(profile: UserProfile, items: List[Dict[str, Any]]) -> Lis
         return []
     if TEXT_DEPLOYMENT_ID == "disabled":
         return [""] * len(items)
-    res = await call_deployment(TEXT_DEPLOYMENT_ID, {"messages": [{"role": "system", "content": kpss_guardrails_instruction()}], "temperature": 0.2})
-    if not res.get("ok"):
-        return [""] * len(items)
+    # Burada gerçek LLM açıklaması tasarlanabilir
     return [""] * len(items)
 
 # =============================================================================
-# API Endpoints
+# API Endpoints: Positions / Match / AI Recommendations / Favorites / Preferences
 # =============================================================================
-
-@app.get("/health")
-async def health():
-    return json_utf8({"ok": True, "status": "healthy"})
 
 @app.post("/kpss/positions/import-mock")
 async def import_mock_positions():
@@ -1289,7 +1257,6 @@ async def kpss_ai_recommendations(req: AiRecommendRequest):
 
 @app.post("/kpss/ai/quick30", response_model=AiRecommendResponse)
 async def kpss_ai_quick30(req: AiRecommendRequest):
-    # Kullanıcı top_n gönderse bile en fazla 30’a kısıtlanır
     req.top_n = min(30, max(1, req.top_n))
     return await kpss_ai_recommendations(req)
 
@@ -1349,4 +1316,39 @@ async def kpss_preferences_save(req: SavePreferenceRequest):
     normalized: List[Dict[str, Any]] = []
     for item in req.preferences:
         if isinstance(item, dict) and "position_id" in item:
-            parsed = SavePreferenceItem
+            parsed = SavePreferenceItem(**item)
+            normalized.append({"position_id": parsed.position_id, "priority": parsed.priority})
+        elif isinstance(item, str):
+            normalized.append({"position_id": item, "priority": 3})
+        else:
+            raise HTTPException(status_code=400, detail="preferences öğesi hatalı formatta")
+
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Boş tercih listesi")
+
+    try:
+        repo_save_preferences(req.user_id, normalized, req.notes)
+        return json_utf8({"ok": True, "saved_count": len(normalized)})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Kaydetme hatası: {str(e)}")
+
+@app.get("/kpss/preferences/list")
+async def kpss_preferences_list(user_id: str = Query(...)):
+    data = repo_list_preferences(user_id)
+    return json_utf8({"ok": True, "history": data})
+
+@app.get("/kpss/favorites")
+async def kpss_favorites(user_id: str = Query(...)):
+    ids = repo_list_favorites(user_id)
+    return json_utf8({"ok": True, "favorites": ids})
+
+@app.post("/kpss/favorites/toggle")
+async def kpss_favorites_toggle(user_id: str = Body(...), position_id: str = Body(...)):
+    added = repo_toggle_favorite(user_id, position_id)
+    return json_utf8({"ok": True, "added": added, "position_id": position_id})
+
+# =============================================================================
+# Run tips
+# =============================================================================
+# Uvicorn ile:
+# uvicorn app:app --host 0.0.0.0 --port 8000 --reload
